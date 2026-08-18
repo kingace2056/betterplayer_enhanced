@@ -462,6 +462,10 @@ enum VideoEventType {
   /// Picture in picture mode has been dismissed
   pipStop,
 
+  /// The duration of the video has been updated after initialization
+  /// (e.g. an HLS stream whose length resolved after playback started).
+  durationUpdate,
+
   /// An unknown event has been received.
   unknown,
 }

@@ -12,12 +12,29 @@ static void* playbackBufferEmptyContext = &playbackBufferEmptyContext;
 static void* playbackBufferFullContext = &playbackBufferFullContext;
 static void* presentationSizeContext = &presentationSizeContext;
 
+// ~8s of 250ms retries: long enough for a cold VOD duration to resolve,
+// bounded so genuine live / unresolvable streams still initialize.
+static const int kBetterPlayerMaxInitDurationRetries = 32;
+
+#if DEBUG
+// Dev-only reproduction switch for the HLS "00:00" duration bug.
+// Flip to YES (e.g. via the debugger) to force a zero/indefinite duration on
+// ANY video so the symptom can be validated deterministically.
+static BOOL gBetterPlayerForceZeroDuration = NO;
+#endif
+
 
 #if TARGET_OS_IOS
 void (^__strong _Nonnull _restoreUserInterfaceForPIPStopCompletionHandler)(BOOL);
 API_AVAILABLE(ios(9.0))
 AVPictureInPictureController *_pipController;
 #endif
+
+@interface BetterPlayer ()
+// Private helpers for the cold-load duration self-heal.
+- (void)emitDurationUpdateIfChanged;
+- (void)pollDurationForUpdate;
+@end
 
 @implementation BetterPlayer
 
@@ -123,6 +140,14 @@ AVPictureInPictureController *_pipController;
     _disposed = false;
     _failedCount = 0;
     _key = nil;
+    _initDurationRetryCount = 0;
+    _postInitDurationPollCount = 0;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                             selector:@selector(onReadyToPlay)
+                                               object:nil];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                             selector:@selector(pollDurationForUpdate)
+                                               object:nil];
     if (_player.currentItem == nil) {
         return;
     }
@@ -285,6 +310,15 @@ static inline CGFloat radiansToDegrees(CGFloat radians) {
     _stalledCount = 0;
     _isStalledCheckStarted = false;
     _playerRate = 1;
+    _lastReportedDurationMillis = 0;
+    _initDurationRetryCount = 0;
+    _postInitDurationPollCount = 0;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                             selector:@selector(onReadyToPlay)
+                                               object:nil];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                             selector:@selector(pollDurationForUpdate)
+                                               object:nil];
     [_player replaceCurrentItemWithPlayerItem:item];
 
     AVAsset* asset = [item asset];
@@ -418,6 +452,10 @@ static inline CGFloat radiansToDegrees(CGFloat radians) {
             }
             _eventSink(@{@"event" : @"bufferingUpdate", @"values" : values, @"key" : _key});
         }
+        // Re-emit duration once it resolves. For HLS without #EXT-X-ENDLIST the
+        // seekable window (and therefore the derived duration) grows as the
+        // playlist is parsed, so a one-time read at init is not enough.
+        [self emitDurationUpdateIfChanged];
     }
     else if (context == presentationSizeContext){
         [self onReadyToPlay];
@@ -447,6 +485,9 @@ static inline CGFloat radiansToDegrees(CGFloat radians) {
     } else if (context == playbackLikelyToKeepUpContext) {
         if ([[_player currentItem] isPlaybackLikelyToKeepUp]) {
             [self updatePlayingState];
+            // A cold VOD whose duration resolved late may reach this point after
+            // loadedTimeRanges has gone quiet; re-emit so Dart gets the real length.
+            [self emitDurationUpdateIfChanged];
             if (_eventSink != nil) {
                 _eventSink(@{@"event" : @"bufferingEnd", @"key" : _key});
             }
@@ -456,6 +497,9 @@ static inline CGFloat radiansToDegrees(CGFloat radians) {
             _eventSink(@{@"event" : @"bufferingStart", @"key" : _key});
         }
     } else if (context == playbackBufferFullContext) {
+        // Buffering just completed (loadedTimeRanges typically stops here); make
+        // sure a late-resolved duration still reaches Dart.
+        [self emitDurationUpdateIfChanged];
         if (_eventSink != nil) {
             _eventSink(@{@"event" : @"bufferingEnd", @"key" : _key});
         }
@@ -483,6 +527,39 @@ static inline CGFloat radiansToDegrees(CGFloat radians) {
     }
 }
 
+- (void)emitDurationUpdateIfChanged {
+    if (!_isInitialized || _eventSink == nil) {
+        return;
+    }
+    int64_t currentDuration = [self duration];
+    if (currentDuration > 0 && currentDuration != _lastReportedDurationMillis) {
+        _lastReportedDurationMillis = currentDuration;
+        _eventSink(@{@"event" : @"durationUpdate", @"duration" : @(currentDuration), @"key" : _key});
+    }
+}
+
+// Belt-and-suspenders for the bounded init fallback: if `initialized` was
+// published with an unresolved duration, keep checking briefly (bounded) so the
+// corrected duration reaches Dart even if every buffering observer has already
+// fired. Self-cancels once a real duration is emitted or the budget is spent.
+- (void)pollDurationForUpdate {
+    if (_disposed) {
+        return;
+    }
+    [self emitDurationUpdateIfChanged];
+    if (_lastReportedDurationMillis > 0 ||
+        _postInitDurationPollCount >= kBetterPlayerMaxInitDurationRetries) {
+        return;
+    }
+    _postInitDurationPollCount++;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                             selector:@selector(pollDurationForUpdate)
+                                               object:nil];
+    [self performSelector:@selector(pollDurationForUpdate)
+               withObject:nil
+               afterDelay:0.25];
+}
+
 - (void)onReadyToPlay {
     if (_eventSink && !_isInitialized && _key) {
         if (!_player.currentItem) {
@@ -504,9 +581,24 @@ static inline CGFloat radiansToDegrees(CGFloat radians) {
         if (!onlyAudio && height == CGSizeZero.height && width == CGSizeZero.width) {
             return;
         }
-        const BOOL isLive = CMTIME_IS_INDEFINITE([_player currentItem].duration);
-        // The player may be initialized but still needs to determine the duration.
-        if (isLive == false && [self duration] == 0) {
+        // Do not publish `initialized` until a real duration resolves. A cold-
+        // loading VOD (trailing-moov MP4 or HLS before #EXT-X-ENDLIST) reports an
+        // indefinite item duration and an empty seekable window for a moment, so
+        // reading duration here yields 0 -> the "00:00" at the initialized edge.
+        // Retry briefly (same performSelector pattern as startStalledCheck); fall
+        // back to publishing after a bounded wait so genuine live / unresolvable
+        // streams still initialize and the Dart setupDataSource() completer (which
+        // awaits `initialized`) always resolves. The DEBUG force-zero switch still
+        // works because [self duration] honors it.
+        if ([self duration] <= 0 &&
+            _initDurationRetryCount < kBetterPlayerMaxInitDurationRetries) {
+            _initDurationRetryCount++;
+            [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                                     selector:@selector(onReadyToPlay)
+                                                       object:nil];
+            [self performSelector:@selector(onReadyToPlay)
+                       withObject:nil
+                       afterDelay:0.25];
             return;
         }
 
@@ -522,6 +614,7 @@ static inline CGFloat radiansToDegrees(CGFloat radians) {
         }
 
         _isInitialized = true;
+        _lastReportedDurationMillis = [self duration];
         [self updatePlayingState];
         _eventSink(@{
             @"event" : @"initialized",
@@ -530,6 +623,20 @@ static inline CGFloat radiansToDegrees(CGFloat radians) {
             @"height" : @(fabs(realSize.height) ? : height),
             @"key" : _key
         });
+
+        // If we fell back to `initialized` without a resolved duration (the
+        // bounded retry budget was hit on a slow cold load), poll briefly so the
+        // corrected duration still reaches Dart even when the buffering observers
+        // have already gone quiet -- this closes the residual 00:00 tail.
+        if ([self duration] <= 0) {
+            _postInitDurationPollCount = 0;
+            [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                                     selector:@selector(pollDurationForUpdate)
+                                                       object:nil];
+            [self performSelector:@selector(pollDurationForUpdate)
+                       withObject:nil
+                       afterDelay:0.25];
+        }
     }
 }
 
@@ -554,6 +661,11 @@ static inline CGFloat radiansToDegrees(CGFloat radians) {
 }
 
 - (int64_t)duration {
+#if DEBUG
+    if (gBetterPlayerForceZeroDuration) {
+        return 0;
+    }
+#endif
     CMTime time;
     if (@available(iOS 13, *)) {
         time =  [[_player currentItem] duration];
@@ -564,7 +676,26 @@ static inline CGFloat radiansToDegrees(CGFloat radians) {
         time = [[_player currentItem] forwardPlaybackEndTime];
     }
 
+    // HLS playlists without #EXT-X-ENDLIST (or whose duration has not resolved
+    // yet) report an indefinite duration on iOS. Fall back to the seekable
+    // window so VOD content shows a real length instead of 00:00.
+    if (CMTIME_IS_INDEFINITE(time) || CMTIME_IS_INVALID(time) || time.timescale == 0) {
+        return [self seekableDurationMillis];
+    }
+
     return [BetterPlayerTimeUtils FLTCMTimeToMillis:(time)];
+}
+
+- (int64_t)seekableDurationMillis {
+    NSArray* ranges = _player.currentItem.seekableTimeRanges;
+    if (ranges.count > 0) {
+        CMTimeRange range = [[ranges lastObject] CMTimeRangeValue];
+        CMTime end = CMTimeRangeGetEnd(range);
+        if (CMTIME_IS_NUMERIC(end)) {
+            return [BetterPlayerTimeUtils FLTCMTimeToMillis:end];
+        }
+    }
+    return 0;
 }
 
 - (void)seekTo:(int)location {

@@ -7,6 +7,7 @@
 @implementation BetterPlayerTimeUtils
 
 + (int64_t) FLTCMTimeToMillis:(CMTime) time {
+    if (CMTIME_IS_INVALID(time) || CMTIME_IS_INDEFINITE(time)) return 0;
     if (time.timescale == 0) return 0;
     return time.value * 1000 / time.timescale;
 }

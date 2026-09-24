@@ -389,6 +389,13 @@ static inline CGFloat radiansToDegrees(CGFloat radians) {
                       _eventSink(@{@"event" : @"play"});
                     }
                 }
+
+                // AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate (buffering while
+                // resuming from PiP) falls through here with no explicit branch above.
+                // Without this return it reached the stall-check below, which forced
+                // playImmediatelyAtRate: while the player was still buffering and caused
+                // a stutter on every PiP resume.
+                return;
             }
         }
 
@@ -472,6 +479,16 @@ static inline CGFloat radiansToDegrees(CGFloat radians) {
 
     if (_isPlaying) {
         if (@available(iOS 10.0, *)) {
+            // While PiP is active and AVKit already has the player playing or
+            // buffering to resume, let it drive playback itself. Forcing
+            // playImmediatelyAtRate: here fights AVKit's own resume and stutters.
+            // Pause (the else branch below) is never skipped, so app-initiated
+            // pauses (e.g. audio interruptions) during PiP still work.
+            if (_pipController.pictureInPictureActive &&
+                (_player.timeControlStatus == AVPlayerTimeControlStatusPlaying ||
+                 _player.timeControlStatus == AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate)) {
+                return;
+            }
             [_player playImmediatelyAtRate:1.0];
             _player.rate = _playerRate;
         } else {
